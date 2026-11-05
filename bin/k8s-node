@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# k8s-node: saúde dos nodes.
+set -uo pipefail
+. /usr/local/lib/k8s-toolbox/lib.sh
+
+usage() {
+  cat <<EOF
+uso: k8s-node [node]
+
+Sem argumento: resumo de todos os nodes (Ready, pressões, cordon, taints, uso).
+Com node: condições, taints, recursos alocados e pods com problema nele.
+EOF
+}
+
+parse_args "$@"
+NODE="${ARGS[0]:-}"
+require_api
+
+if [ -z "$NODE" ]; then
+  title "Nodes"
+  {
+    printf 'NODE\tREADY\tPRESSÃO\tCORDON\tTAINTS\tKUBELET\n'
+    kubectl get nodes -o json | jq -r '.items[] | [
+      .metadata.name,
+      (.status.conditions[] | select(.type == "Ready") | .status),
+      ([.status.conditions[] | select(.type != "Ready" and .status == "True") | .type] | join(",") | if . == "" then "-" else . end),
+      (if .spec.unschedulable then "sim" else "-" end),
+      ((.spec.taints // []) | map(.key + ":" + .effect) | join(",") | if . == "" then "-" else . end),
+      .status.nodeInfo.kubeletVersion ] | @tsv'
+  } | column -t -s $'\t' | indent
+  title "Uso"
+  kubectl top nodes 2>/dev/null | indent || warn "metrics-server indisponível"
+  exit 0
+fi
+
+JSON="$(kubectl get node "$NODE" -o json)" || exit 1
+
+title "Node $NODE"
+jq -r '.status.nodeInfo | "SO: \(.osImage) | kernel \(.kernelVersion) | runtime \(.containerRuntimeVersion) | kubelet \(.kubeletVersion)"' <<<"$JSON" | indent
+
+title "Condições"
+jq -r '.status.conditions[] | "\(.type)\t\(.status)\t\(.reason)\t\(.lastTransitionTime)"' <<<"$JSON" | column -t -s $'\t' | indent
+if jq -e '.status.conditions[] | select(.type == "Ready" and .status != "True")' <<<"$JSON" >/dev/null; then
+  fail "node NÃO está Ready"
+  hint "kubelet parado, node sem rede com o control plane, ou disco/memória esgotados"
+  hint "entre no node: kubectl debug node/$NODE -it --image=<esta-imagem> --profile=sysadmin"
+  hint "  depois: chroot /host  →  systemctl status kubelet  /  journalctl -u kubelet --since '15 min ago'"
+fi
+
+title "Taints"
+jq -r '(.spec.taints // [])[] | "\(.key)=\(.value // ""):\(.effect)"' <<<"$JSON" | sed '/^$/d' | indent
+jq -e '.spec.unschedulable == true' <<<"$JSON" >/dev/null && warn "node cordoned (kubectl uncordon $NODE)"
+
+title "Recursos alocados (requests/limits)"
+kubectl describe node "$NODE" | sed -n '/^Allocated resources:/,/^Events:/p' | sed '1d;$d' | indent
+kubectl top node "$NODE" 2>/dev/null | indent
+
+title "Pods neste node fora de Running/Succeeded"
+kubectl get pods -A --field-selector "spec.nodeName=$NODE" -o json | jq -r '.items[]
+  | select(.status.phase != "Running" and .status.phase != "Succeeded")
+  | "\(.metadata.namespace)/\(.metadata.name) \(.status.phase) \(.status.reason // "")"' \
+  | report "pods com problema" || true
+
+title "Eventos do node"
+kubectl get events -A --field-selector "involvedObject.kind=Node,involvedObject.name=$NODE" --sort-by=.metadata.creationTimestamp 2>/dev/null | tail -10 | indent

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+. /usr/local/lib/k8s-toolbox/lib.sh
+cat <<EOF
+${BLD}${CYN}k8s-toolbox${RST} — troubleshooting de Kubernetes
+
+${BLD}Diagnóstico${RST}
+  k8s-doctor [-n ns]        varre o cluster: CrashLoop, ImagePull, Pending, OOM,
+                            services sem endpoints, PVC, nodes, DNS, recursos
+  k8s-pod <pod> [-n ns]     por que este pod está quebrado? (motivo, eventos, logs)
+  k8s-svc <svc> [-n ns]     Service/Ingress não responde? (selector, endpoints, porta, DNS, TCP)
+  k8s-dns [nome]            testa o DNS e cada réplica do CoreDNS
+  k8s-node [node]           saúde dos nodes (NotReady, pressão, taints, alocação)
+
+${BLD}Ferramentas${RST}
+  kubectl (alias k), helm, k9s, stern, popeye, kubens, yq, jq
+  dig, nslookup, curl, nc, grpcurl, openssl, tcpdump*, ip, ping
+  ${DIM}* tcpdump/ping precisam rodar como root (kubectl run/debug)${RST}
+
+${BLD}Atalhos úteis${RST}
+  stern -n <ns> <prefixo-do-pod>       logs de vários pods ao mesmo tempo
+  popeye                               relatório de saúde/boas práticas do cluster
+  k9s                                  interface interativa
+EOF

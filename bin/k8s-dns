@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# k8s-dns: testa o DNS do cluster, incluindo cada réplica do CoreDNS.
+set -uo pipefail
+. /usr/local/lib/k8s-toolbox/lib.sh
+
+usage() {
+  cat <<EOF
+uso: k8s-dns [nome-para-testar]
+
+Mostra o resolv.conf, estado do CoreDNS, testa resolução interna/externa
+pelo DNS do cluster e em cada pod do CoreDNS individualmente.
+EOF
+}
+
+parse_args "$@"
+NAME="${ARGS[0]:-}"
+DOMAIN="$(cluster_domain)"
+
+title "resolv.conf deste pod"
+indent < /etc/resolv.conf
+NAMESERVER="$(awk '/^nameserver/{print $2; exit}' /etc/resolv.conf)"
+
+if kubectl get --raw /version >/dev/null 2>&1; then
+  title "CoreDNS"
+  kubectl get pods -n kube-system -l k8s-app=kube-dns -o wide 2>/dev/null | indent
+  kubectl get svc -n kube-system kube-dns 2>/dev/null | indent
+  DNS_PODS="$(kubectl get pods -n kube-system -l k8s-app=kube-dns -o jsonpath='{range .items[*]}{.metadata.name}={.status.podIP}{"\n"}{end}' 2>/dev/null)"
+else
+  warn "sem acesso à API — testando só a resolução"
+  DNS_PODS=""
+fi
+
+lookup() { # lookup <servidor> <nome>
+  local out t0 t1
+  t0=$(date +%s%N 2>/dev/null || date +%s)
+  out="$(dig @"$1" +short +time=2 +tries=1 "$2" 2>&1 | grep -v '^;' | head -3 | tr '\n' ' ')"
+  t1=$(date +%s%N 2>/dev/null || date +%s)
+  if [ -n "$out" ]; then ok "$2 → $out ($(( (t1 - t0) / 1000000 ))ms)"; else fail "$2 não resolveu via $1"; return 1; fi
+}
+
+title "Resolução via DNS do cluster ($NAMESERVER)"
+lookup "$NAMESERVER" "kubernetes.default.svc.$DOMAIN"
+lookup "$NAMESERVER" "kube-dns.kube-system.svc.$DOMAIN"
+lookup "$NAMESERVER" "google.com" || hint "interno ok e externo falhando → upstream/forward do CoreDNS ou egress bloqueado"
+[ -n "$NAME" ] && { dig +search +short +time=2 +tries=1 "$NAME" | grep -q . && ok "$NAME → $(dig +search +short "$NAME" | head -3 | tr '\n' ' ')" || fail "$NAME não resolveu (com search domains)"; }
+
+if [ -n "$DNS_PODS" ]; then
+  title "Cada réplica do CoreDNS"
+  while IFS='=' read -r pod ip; do
+    [ -z "$ip" ] && continue
+    printf '  %s (%s)\n' "$pod" "$ip"
+    lookup "$ip" "kubernetes.default.svc.$DOMAIN" >/dev/null 2>&1 \
+      && ok "  responde" || { fail "  NÃO responde"; hint "réplica quebrada ou NetworkPolicy bloqueando porta 53 para kube-system"; }
+  done <<<"$DNS_PODS"
+
+  title "Erros recentes nos logs do CoreDNS"
+  kubectl logs -n kube-system -l k8s-app=kube-dns --tail=300 --prefix 2>/dev/null \
+    | grep -iE 'error|timeout|refused|SERVFAIL|loop' | tail -10 | report "linhas com erro" warn || true
+fi

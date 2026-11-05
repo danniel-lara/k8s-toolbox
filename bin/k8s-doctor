@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# k8s-doctor: varre o cluster atrás dos problemas mais comuns em produção.
+set -uo pipefail
+. /usr/local/lib/k8s-toolbox/lib.sh
+
+usage() {
+  cat <<EOF
+uso: k8s-doctor [-n namespace]
+
+Varre o cluster inteiro (padrão) ou um namespace e aponta:
+  CrashLoopBackOff, ImagePullBackOff, Pending, OOMKilled, pods não-ready,
+  deployments incompletos, services/ingress sem endpoints, PVC não Bound,
+  nodes NotReady/pressão, CoreDNS, uso de CPU/memória e boas práticas.
+EOF
+}
+
+parse_args "$@"
+require_api
+
+if [ -n "$NS" ]; then SCOPE=(-n "$NS"); SCOPE_TXT="namespace $NS"; else SCOPE=(-A); SCOPE_TXT="todos os namespaces"; fi
+PROBLEMS=0
+p() { PROBLEMS=$((PROBLEMS + 1)); }
+
+printf '%sk8s-doctor%s — contexto: %s — %s\n' "$BLD" "$RST" \
+  "$(kubectl config current-context 2>/dev/null || echo in-cluster)" "$SCOPE_TXT"
+
+PODS="$(kubectl get pods "${SCOPE[@]}" -o json)"
+
+# Todos os containers (init + normais) com referência ao pod
+CS='. as $p | ((.status.initContainerStatuses // []) + (.status.containerStatuses // []))[] | {p: $p, c: .}'
+
+title "Pods"
+jq -r ".items[] | $CS
+  | select((.c.state.waiting.reason // \"\" | IN(\"CrashLoopBackOff\",\"Error\",\"CreateContainerConfigError\",\"CreateContainerError\",\"RunContainerError\"))
+           or ((.c.state.terminated.reason // \"Completed\") | IN(\"Completed\",\"OOMKilled\") | not))
+  | \"\(.p.metadata.namespace)/\(.p.metadata.name) [\(.c.name)] \(.c.state.waiting.reason // .c.state.terminated.reason) restarts=\(.c.restartCount) último_exit=\(.c.lastState.terminated.exitCode // .c.state.terminated.exitCode // \"-\")\"" <<<"$PODS" \
+  | report "CrashLoop / erro ao iniciar" || { p; hint "k8s-pod <pod> -n <ns>  (mostra logs --previous e o motivo)"; }
+
+jq -r ".items[] | $CS
+  | select(.c.state.waiting.reason // \"\" | IN(\"ImagePullBackOff\",\"ErrImagePull\",\"InvalidImageName\"))
+  | \"\(.p.metadata.namespace)/\(.p.metadata.name) [\(.c.name)] \(.c.image) → \(.c.state.waiting.reason)\"" <<<"$PODS" \
+  | report "ImagePullBackOff" || { p; hint "confira nome/tag da imagem e o imagePullSecret do pod/ServiceAccount"; }
+
+jq -r '.items[] | select(.status.phase == "Pending")
+  | select([(.status.containerStatuses // [])[] | .state.waiting.reason // "" | test("ImagePull|ErrImage")] | any | not)
+  | . as $p
+  | ((.status.conditions // []) | map(select(.type == "PodScheduled" and .status == "False")) | .[0].message) as $msg
+  | "\($p.metadata.namespace)/\($p.metadata.name): \($msg // ("agendado, aguardando containers: " + ([(.status.containerStatuses // [])[] | .state.waiting.reason // empty] | unique | join(",") | if . == "" then "?" else . end)))"' <<<"$PODS" \
+  | report "Pending" || { p; hint "Insufficient cpu/memory → recursos; taint → tolerations; nodeSelector/affinity; PVC não Bound"; }
+
+jq -r ".items[] | $CS
+  | select(.c.lastState.terminated.reason == \"OOMKilled\" or .c.state.terminated.reason == \"OOMKilled\")
+  | .c.name as \$cn | ([.p.spec.containers[], (.p.spec.initContainers // [])[]] | map(select(.name == \$cn)) | .[0].resources.limits.memory) as \$lim
+  | \"\(.p.metadata.namespace)/\(.p.metadata.name) [\(.c.name)] limit=\(\$lim // \"sem limit\") restarts=\(.c.restartCount)\"" <<<"$PODS" \
+  | report "OOMKilled" || { p; hint "aumente resources.limits.memory ou investigue vazamento de memória (kubectl top pod)"; }
+
+jq -r '.items[] | select(.status.phase == "Running")
+  | [(.status.containerStatuses // [])[] | select((.ready | not) and .state.running != null) | .name] as $nr
+  | select($nr | length > 0)
+  | "\(.metadata.namespace)/\(.metadata.name): rodando mas não prontos: \($nr | join(","))"' <<<"$PODS" \
+  | report "Running mas NÃO ready (readiness falhando → 502/503)" warn \
+  || hint "kubectl describe pod → eventos 'Readiness probe failed'"
+
+jq -r ".items[] | $CS | select(.c.restartCount >= 5 and (.c.state.running != null))
+  | \"\(.p.metadata.namespace)/\(.p.metadata.name) [\(.c.name)] restarts=\(.c.restartCount) último motivo=\(.c.lastState.terminated.reason // \"-\")\"" <<<"$PODS" \
+  | report "Muitos restarts (≥5) mas rodando agora" warn || true
+
+title "Workloads"
+kubectl get deploy,statefulset "${SCOPE[@]}" -o json | jq -r '.items[]
+  | (.spec.replicas // 1) as $want | (.status.availableReplicas // .status.readyReplicas // 0) as $have
+  | select($have < $want)
+  | "\(.kind)/\(.metadata.namespace)/\(.metadata.name) disponíveis=\($have)/\($want)"' \
+  | report "Deployments/StatefulSets incompletos" || p
+
+title "Services e Ingress"
+# Services com pelo menos um endpoint pronto (via EndpointSlices)
+READY_SVCS="$(kubectl get endpointslices "${SCOPE[@]}" -o json 2>/dev/null | jq -c '[.items[]
+  | select([(.endpoints // [])[] | select(.conditions.ready != false)] | length > 0)
+  | "\(.metadata.namespace)/\(.metadata.labels["kubernetes.io/service-name"])"] | unique')"
+READY_SVCS="${READY_SVCS:-[]}"
+
+kubectl get svc "${SCOPE[@]}" -o json | jq -r --argjson ready "$READY_SVCS" '.items[]
+  | select(.spec.selector != null and .spec.type != "ExternalName")
+  | "\(.metadata.namespace)/\(.metadata.name)" as $k | select($ready | index($k) | not)
+  | "\($k) selector=\(.spec.selector | to_entries | map("\(.key)=\(.value)") | join(","))"' \
+  | report "Services sem endpoints prontos" || { p; hint "k8s-svc <service> -n <ns>  (selector x labels, targetPort, NetworkPolicy)"; }
+
+kubectl get ingress "${SCOPE[@]}" -o json 2>/dev/null | jq -r --argjson ready "$READY_SVCS" '.items[] | . as $i
+  | ([.spec.defaultBackend.service.name // empty] + [(.spec.rules // [])[] | (.http.paths // [])[] | .backend.service.name // empty]) | unique[]
+  | select(($ready | index("\($i.metadata.namespace)/\(.)")) | not)
+  | "ingress \($i.metadata.namespace)/\($i.metadata.name) → service \(.) sem endpoints (vai dar 502/503)"' \
+  | report "Ingress apontando para backend sem endpoints" || p
+
+title "Storage"
+kubectl get pvc "${SCOPE[@]}" -o json | jq -r '.items[] | select(.status.phase != "Bound")
+  | "\(.metadata.namespace)/\(.metadata.name) status=\(.status.phase) storageClass=\(.spec.storageClassName // "-") tamanho=\(.spec.resources.requests.storage) modos=\(.spec.accessModes | join(","))"' \
+  | report "PVC não Bound" || { p; hint "kubectl describe pvc <pvc> → StorageClass existe? provisioner funcionando? accessMode suportado?"; }
+
+title "Nodes"
+NODES="$(kubectl get nodes -o json 2>/dev/null)"
+if [ -n "$NODES" ]; then
+  jq -r '.items[] | select([.status.conditions[] | select(.type == "Ready" and .status == "True")] | length == 0)
+    | "\(.metadata.name): \(.status.conditions[] | select(.type == "Ready") | "\(.reason) — \(.message)")"' <<<"$NODES" \
+    | report "Nodes NotReady" || { p; hint "k8s-node <node>  e  kubectl debug node/<node> -it --image=<esta-imagem> → chroot /host"; }
+  jq -r '.items[] | .metadata.name as $n | .status.conditions[]
+    | select(.type != "Ready" and .status == "True") | "\($n): \(.type) — \(.message)"' <<<"$NODES" \
+    | report "Nodes com pressão (memória/disco/PID/rede)" || p
+  jq -r '.items[] | select(.spec.unschedulable == true) | "\(.metadata.name) (cordoned)"' <<<"$NODES" \
+    | report "Nodes cordoned" warn || true
+else
+  warn "sem permissão para listar nodes"
+fi
+
+title "DNS (CoreDNS)"
+kubectl get pods -n kube-system -l k8s-app=kube-dns -o json 2>/dev/null | jq -r '.items[]
+  | select(.status.phase != "Running" or ([(.status.containerStatuses // [])[] | select(.ready | not)] | length > 0))
+  | "\(.metadata.name) fase=\(.status.phase)"' \
+  | report "Pods do CoreDNS com problema" || p
+if in_cluster; then
+  if dig +search +short +time=2 +tries=1 kubernetes.default | grep -q .; then
+    ok "resolução interna (kubernetes.default) funcionando"
+  else
+    fail "não resolveu kubernetes.default"; p; hint "k8s-dns  (testa cada réplica do CoreDNS)"
+  fi
+else
+  hint "teste de resolução pulado (rodando fora do cluster)"
+fi
+
+title "Uso de recursos"
+if TOP="$(kubectl top nodes --no-headers 2>/dev/null)"; then
+  awk '{c=$3; m=$5; gsub("%","",c); gsub("%","",m); if (c+0 >= 85 || m+0 >= 85) print $1": CPU "$3" | memória "$5}' <<<"$TOP" \
+    | report "Nodes com CPU ou memória ≥ 85%" warn || hint "kubectl top pods -A --sort-by=memory | head"
+  echo "  Top 5 pods por memória:"
+  kubectl top pods "${SCOPE[@]}" --sort-by=memory --no-headers 2>/dev/null | head -5 | indent
+else
+  warn "kubectl top indisponível (metrics-server não instalado?)"
+fi
+
+title "Boas práticas"
+SKIP='select(.metadata.namespace | IN("kube-system","kube-public","kube-node-lease") | not)'
+jq -r ".items[] | $SKIP | . as \$p | .spec.containers[] | select(.resources.limits.memory == null)
+  | \"\(\$p.metadata.namespace)/\(\$p.metadata.name) [\(.name)]\"" <<<"$PODS" | head -15 \
+  | report "Containers sem limit de memória (até 15)" warn || true
+jq -r ".items[] | $SKIP | . as \$p | .spec.containers[] | select(.readinessProbe == null)
+  | \"\(\$p.metadata.namespace)/\(\$p.metadata.name) [\(.name)]\"" <<<"$PODS" | head -15 \
+  | report "Containers sem readinessProbe (até 15)" warn || true
+
+title "Últimos eventos de Warning"
+kubectl get events "${SCOPE[@]}" --field-selector type=Warning --sort-by=.metadata.creationTimestamp 2>/dev/null \
+  | tail -15 | indent
+
+echo
+if [ "$PROBLEMS" -eq 0 ]; then
+  printf '%s%s✔ Nenhum problema crítico encontrado.%s\n' "$BLD" "$GRN" "$RST"
+else
+  printf '%s%s✘ %d grupo(s) de problema encontrados.%s\n' "$BLD" "$RED" "$PROBLEMS" "$RST"
+fi
+exit $(( PROBLEMS > 0 ))

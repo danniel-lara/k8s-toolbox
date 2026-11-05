@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# k8s-svc: por que meu Service/Ingress não responde?
+set -uo pipefail
+. /usr/local/lib/k8s-toolbox/lib.sh
+
+usage() {
+  cat <<EOF
+uso: k8s-svc <service> [-n namespace]
+
+Verifica a cadeia Ingress → Service → Endpoints → Pods:
+selector x labels, pods prontos, targetPort x porta do container,
+DNS do service, conexão TCP em cada porta, NetworkPolicies e Ingress.
+EOF
+}
+
+parse_args "$@"
+SVC="${ARGS[0]:-}"
+[ -z "$SVC" ] && { usage; exit 1; }
+NS="${NS:-$(current_ns)}"
+require_api
+
+JSON="$(kubectl get svc "$SVC" -n "$NS" -o json)" || exit 1
+TYPE="$(jq -r '.spec.type' <<<"$JSON")"
+SEL="$(jq -r '(.spec.selector // {}) | to_entries | map("\(.key)=\(.value)") | join(",")' <<<"$JSON")"
+
+title "Service $NS/$SVC"
+kubectl get svc "$SVC" -n "$NS" -o wide | indent
+echo "  tipo: $TYPE"
+jq -r '.spec.ports[] | "  porta \(.port)/\(.protocol) → targetPort \(.targetPort)\(if .nodePort then " (nodePort \(.nodePort))" else "" end)\(if .name then " [" + .name + "]" else "" end)"' <<<"$JSON"
+if [ "$TYPE" = "LoadBalancer" ]; then
+  LB="$(jq -r '[.status.loadBalancer.ingress[]? | .ip // .hostname] | join(",")' <<<"$JSON")"
+  [ -n "$LB" ] && ok "LoadBalancer: $LB" || fail "LoadBalancer sem IP externo (pending) — veja os eventos do service"
+fi
+
+title "Selector → Pods"
+if [ "$TYPE" = "ExternalName" ]; then
+  ok "ExternalName → $(jq -r .spec.externalName <<<"$JSON") (sem pods/endpoints)"
+elif [ -z "$SEL" ]; then
+  warn "service sem selector: os endpoints precisam ser criados manualmente"
+else
+  echo "  selector: $SEL"
+  PODS="$(kubectl get pods -n "$NS" -l "$SEL" -o json)"
+  TOTAL="$(jq '.items | length' <<<"$PODS")"
+  READY="$(jq '[.items[] | select((.status.conditions // [])[] | select(.type == "Ready" and .status == "True"))] | length' <<<"$PODS")"
+  if [ "$TOTAL" -eq 0 ]; then
+    fail "NENHUM pod tem esses labels — selector errado (o problema mais comum!)"
+    hint "labels dos pods do namespace:"
+    kubectl get pods -n "$NS" --show-labels --no-headers 2>/dev/null | awk '{print $1"  "$NF}' | head -10 | indent
+  else
+    [ "$READY" -eq "$TOTAL" ] && ok "$READY/$TOTAL pods prontos" || fail "só $READY/$TOTAL pods prontos (os não-ready ficam fora do Service)"
+    kubectl get pods -n "$NS" -l "$SEL" -o wide | indent
+
+    title "targetPort x portas dos containers"
+    jq -r --argjson pods "$PODS" '
+      ([$pods.items[].spec.containers[].ports[]?] ) as $cp
+      | .spec.ports[] | .targetPort as $t
+      | if ($t | type) == "string" then
+          (if ([$cp[] | select(.name == $t)] | length) > 0 then "OK  targetPort \"\($t)\" encontrado nos containers"
+           else "ERRO targetPort nomeado \"\($t)\" não existe em nenhum container (portas: \([$cp[] | "\(.name // "-")=\(.containerPort)"] | unique | join(", ")))" end)
+        else
+          (if ([$cp[] | select(.containerPort == $t)] | length) > 0 then "OK  targetPort \($t) declarado no container"
+           elif ($cp | length) == 0 then "?   targetPort \($t): containers não declaram ports (confira se a app escuta nessa porta)"
+           else "AVISO targetPort \($t) não está entre as portas declaradas (\([$cp[] | .containerPort] | unique | map(tostring) | join(", ")))" end)
+        end' <<<"$JSON" | while read -r line; do
+          case "$line" in OK*) ok "${line#OK  }";; ERRO*) fail "${line#ERRO }";; AVISO*) warn "${line#AVISO }";; *) warn "${line#?   }";; esac
+        done
+  fi
+
+  title "Endpoints (EndpointSlices)"
+  kubectl get endpointslices -n "$NS" -l "kubernetes.io/service-name=$SVC" -o json | jq -r '
+    [.items[] | (.endpoints // [])[] | "\(.addresses[0]) \(.targetRef.name // "-") ready=\(.conditions.ready)"] | if length == 0 then "NENHUM" else .[] end' \
+    | while read -r line; do
+        if [ "$line" = "NENHUM" ]; then fail "service sem endpoints → conexões recusadas / Ingress 503"; else echo "      $line"; fi
+      done
+fi
+
+if in_cluster && [ "$TYPE" != "ExternalName" ]; then
+  FQDN="$SVC.$NS.svc.$(cluster_domain)"
+  title "DNS e conectividade (a partir deste pod)"
+  IP="$(dig +short +time=2 +tries=1 "$FQDN" | head -1)"
+  if [ -n "$IP" ]; then ok "$FQDN → $IP"; else fail "DNS não resolveu $FQDN"; hint "k8s-dns"; fi
+  for port in $(jq -r '.spec.ports[] | select(.protocol == "TCP") | .port' <<<"$JSON"); do
+    if nc -z -w 3 "$FQDN" "$port" 2>/dev/null; then
+      ok "TCP $port aberta"
+    else
+      fail "TCP $port não conectou"
+      hint "sem endpoints? app não escuta no targetPort? NetworkPolicy bloqueando o namespace deste pod?"
+    fi
+  done
+fi
+
+title "NetworkPolicies no namespace $NS"
+kubectl get networkpolicy -n "$NS" -o json 2>/dev/null | jq -r '.items[]
+  | "\(.metadata.name): aplica em \(if (.spec.podSelector.matchLabels // {}) == {} then "TODOS os pods" else (.spec.podSelector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")) end) | tipos=\(.spec.policyTypes // ["Ingress"] | join(","))"' \
+  | report "NetworkPolicies (podem bloquear tráfego)" warn || hint "se a policy pega estes pods, a origem precisa estar liberada em spec.ingress.from"
+
+title "Ingress que usam este service"
+kubectl get ingress -n "$NS" -o json 2>/dev/null | jq -r --arg s "$SVC" '.items[] | . as $i
+  | (.spec.rules // [])[] | .host as $h | (.http.paths // [])[] | select(.backend.service.name == $s)
+  | "\($i.metadata.name): \($h // "*")\(.path // "/") → \($s):\(.backend.service.port.number // .backend.service.port.name) (class=\($i.spec.ingressClassName // "default"))"' \
+  | sed '/^$/d' | indent

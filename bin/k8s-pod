@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# k8s-pod: diagnóstico completo de um pod.
+set -uo pipefail
+. /usr/local/lib/k8s-toolbox/lib.sh
+
+usage() {
+  cat <<EOF
+uso: k8s-pod <pod> [-n namespace]
+
+Mostra estado de cada container, motivo do erro com dica de correção,
+resources/probes, eventos, logs do crash anterior e logs atuais.
+Variável TAIL controla quantas linhas de log (padrão 30).
+EOF
+}
+
+parse_args "$@"
+POD="${ARGS[0]:-}"
+[ -z "$POD" ] && { usage; exit 1; }
+NS="${NS:-$(current_ns)}"
+TAIL="${TAIL:-30}"
+require_api
+
+JSON="$(kubectl get pod "$POD" -n "$NS" -o json)" || exit 1
+
+title "Pod $NS/$POD"
+kubectl get pod "$POD" -n "$NS" -o wide | indent
+
+title "Containers"
+jq -r '((.status.initContainerStatuses // []) | map(. + {init: true})) + (.status.containerStatuses // []) | .[]
+  | "\(if .init then "[init] " else "" end)\(.name)\n" +
+    "   imagem:    \(.image)\n" +
+    "   ready=\(.ready)  restarts=\(.restartCount)\n" +
+    "   estado:    \(.state | keys[0])\(if .state.waiting then " (" + .state.waiting.reason + ")" elif .state.terminated then " (" + .state.terminated.reason + ", exit " + (.state.terminated.exitCode | tostring) + ")" else "" end)\n" +
+    "   anterior:  \(if .lastState.terminated then .lastState.terminated.reason + ", exit " + (.lastState.terminated.exitCode | tostring) + " em " + (.lastState.terminated.finishedAt // "?") else "-" end)"' <<<"$JSON" | indent
+
+title "Diagnóstico"
+REASONS="$(jq -r '((.status.initContainerStatuses // []) + (.status.containerStatuses // []))[]
+  | (.state.waiting.reason // empty), (.state.terminated.reason // empty), (.lastState.terminated.reason // empty),
+    ("exit" + ((.lastState.terminated.exitCode // .state.terminated.exitCode // empty) | tostring))' <<<"$JSON" | sort -u)"
+PHASE="$(jq -r '.status.phase' <<<"$JSON")"
+SCHED="$(jq -r '(.status.conditions // [])[] | select(.type == "PodScheduled" and .status == "False") | .message' <<<"$JSON")"
+FOUND=0
+has() { grep -qx "$1" <<<"$REASONS"; }
+
+if has CrashLoopBackOff || has Error; then FOUND=1
+  fail "CrashLoopBackOff: o container inicia e morre."
+  hint "leia os 'Logs do crash anterior' abaixo — o erro da aplicação costuma estar lá"
+  hint "config/variáveis/secrets errados, dependência fora do ar, liveness probe agressiva demais"
+fi
+if has exit137 && ! has OOMKilled; then FOUND=1
+  warn "exit 137 sem OOMKilled: processo morto por SIGKILL (liveness probe falhando ou kill externo)"; fi
+has exit143 && { FOUND=1; warn "exit 143: SIGTERM — o pod foi desligado (deploy, eviction, liveness)"; }
+has exit127 && { FOUND=1; fail "exit 127: comando não encontrado — confira command/args e o entrypoint da imagem"; }
+has exit126 && { FOUND=1; fail "exit 126: sem permissão para executar o entrypoint"; }
+has exit1   && { FOUND=1; warn "exit 1: erro da aplicação — veja os logs"; }
+if has OOMKilled; then FOUND=1
+  fail "OOMKilled: passou do limit de memória."
+  jq -r '.spec.containers[] | "   \(.name): requests=\(.resources.requests.memory // "-") limits=\(.resources.limits.memory // "sem limit")"' <<<"$JSON" | indent
+  hint "aumente resources.limits.memory ou investigue vazamento (kubectl top pod $POD -n $NS --containers)"
+fi
+if has ImagePullBackOff || has ErrImagePull || has InvalidImageName; then FOUND=1
+  fail "Não conseguiu baixar a imagem."
+  hint "imagem/tag existem? registry privado → imagePullSecrets: $(jq -r '[.spec.imagePullSecrets[]?.name] | join(",") | if . == "" then "nenhum configurado" else . end' <<<"$JSON")"
+  hint "a mensagem exata aparece nos eventos abaixo (401/403 = credencial, not found = nome/tag)"
+fi
+if has CreateContainerConfigError; then FOUND=1
+  fail "CreateContainerConfigError: ConfigMap ou Secret referenciado não existe (ou a chave não existe)."
+  jq -r '[.spec.containers[] | (.env // [])[] | .valueFrom | (.secretKeyRef // .configMapKeyRef // empty) | .name] +
+         [.spec.containers[] | (.envFrom // [])[] | (.secretRef // .configMapRef) | .name] | unique | join(", ")
+         | "   referências: " + .' <<<"$JSON" | indent
+fi
+if [ "$PHASE" = "Pending" ] && [ -n "$SCHED" ]; then FOUND=1
+  fail "Pending — não agendado: $SCHED"
+  case "$SCHED" in
+    *Insufficient*)      hint "faltam recursos: reduza requests ou adicione nodes (kubectl describe nodes | grep -A5 Allocated)";;
+    *taint*)             hint "nodes com taint que o pod não tolera: kubectl get nodes -o custom-columns=N:.metadata.name,T:.spec.taints";;
+    *affinity*|*selector*) hint "nodeSelector/affinity não bate com nenhum node: kubectl get nodes --show-labels";;
+    *PersistentVolumeClaim*|*volume*) hint "PVC não Bound: kubectl get pvc -n $NS";;
+  esac
+fi
+if jq -e '[(.status.containerStatuses // [])[] | select((.ready | not) and .state.running != null)] | length > 0' <<<"$JSON" >/dev/null; then FOUND=1
+  warn "Rodando mas NÃO ready: readiness probe falhando → o Service não manda tráfego (Ingress 502/503)."
+fi
+[ "$FOUND" -eq 0 ] && ok "nenhum problema óbvio no status do pod"
+
+title "Resources e probes"
+jq -r '.spec.containers[] | "\(.name): req cpu=\(.resources.requests.cpu // "-") mem=\(.resources.requests.memory // "-") | lim cpu=\(.resources.limits.cpu // "-") mem=\(.resources.limits.memory // "-")\n" +
+  "   liveness=\(if .livenessProbe then (.livenessProbe | (if .httpGet then "http " + (.httpGet.path // "/") + ":" + (.httpGet.port | tostring) elif .tcpSocket then "tcp " + (.tcpSocket.port | tostring) elif .exec then "exec" else "grpc" end) + " delay=\(.initialDelaySeconds // 0)s period=\(.periodSeconds // 10)s fail=\(.failureThreshold // 3)") else "NÃO" end)\n" +
+  "   readiness=\(if .readinessProbe then (.readinessProbe | (if .httpGet then "http " + (.httpGet.path // "/") + ":" + (.httpGet.port | tostring) elif .tcpSocket then "tcp " + (.tcpSocket.port | tostring) elif .exec then "exec" else "grpc" end)) else "NÃO" end)"' <<<"$JSON" | indent
+kubectl top pod "$POD" -n "$NS" --containers 2>/dev/null | indent
+
+title "Eventos"
+kubectl get events -n "$NS" --field-selector "involvedObject.name=$POD" --sort-by=.metadata.creationTimestamp 2>/dev/null | tail -15 | indent
+
+for c in $(jq -r '((.status.initContainerStatuses // []) + (.status.containerStatuses // []))[] | select(.restartCount > 0) | .name' <<<"$JSON"); do
+  title "Logs do crash anterior [$c] (últimas $TAIL linhas)"
+  kubectl logs "$POD" -n "$NS" -c "$c" --previous --tail="$TAIL" 2>&1 | indent
+done
+for c in $(jq -r '.spec.containers[].name' <<<"$JSON"); do
+  title "Logs atuais [$c] (últimas $TAIL linhas)"
+  kubectl logs "$POD" -n "$NS" -c "$c" --tail="$TAIL" 2>&1 | indent
+done
