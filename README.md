@@ -60,6 +60,17 @@ make doctor        # roda k8s-doctor
 make exec          # abre o shell
 ```
 
+## Pipeline no GitLab (vários clusters)
+O [.gitlab-ci.yml](.gitlab-ci.yml) gera a imagem no Container Registry do projeto e roda
+`popeye` + `k8s-doctor` em cada cluster, um job por cluster, guardando os relatórios como artefato.
+```bash
+hack/kubeconfig-ci.sh prod-ctx hml-ctx > kubeconfig-ci.yaml   # token somente leitura por cluster
+```
+1. Cole o arquivo numa variável **File** chamada `KUBECONFIG` (Settings > CI/CD > Variables, marque *Protected*) e apague o arquivo local.
+2. Ponha os mesmos nomes de contexto na lista `CONTEXT` do job `scan`.
+3. Rode uma vez com `BUILD=true` (Run pipeline) para gerar a imagem e crie um agendamento em Build > Pipeline schedules.
+O job falha quando o `k8s-doctor` acha problema, e o GitLab avisa por e-mail.
+Para revogar o acesso de um cluster: `kubectl delete -f k8s/ci-token.yaml`.
 ## Segurança
 
 - O RBAC é **somente leitura** (`view` + nodes/PV/storageclasses/métricas). Não lê `secrets`.

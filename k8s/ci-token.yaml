@@ -1,0 +1,10 @@
+# Token de longa duração do ServiceAccount "toolbox" para a pipeline (somente leitura,
+# mesmas permissões do k8s/toolbox.yaml). Para revogar: kubectl delete -f k8s/ci-token.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: toolbox-ci-token
+  namespace: toolbox
+  annotations:
+    kubernetes.io/service-account.name: toolbox
+type: kubernetes.io/service-account-token

@@ -1,0 +1,66 @@
+# Pipeline do k8s-toolbox no GitLab
+#
+#  build → gera a imagem e envia para o Container Registry do projeto
+#          (roda quando Dockerfile, bin/, lib/ ou bashrc mudam na branch padrão, ou numa tag)
+#  scan  → roda popeye + k8s-doctor em cada cluster da lista CONTEXT
+#          (roda em pipeline agendado ou disparado à mão em Build > Pipelines > Run pipeline)
+#
+# Acesso aos clusters: uma variável do tipo *File* chamada KUBECONFIG
+# (Settings > CI/CD > Variables) com um contexto por cluster. Veja hack/kubeconfig-ci.sh.
+# Se usar o GitLab Agent for Kubernetes, o KUBECONFIG já vem pronto: basta pôr na lista
+# o nome do contexto do agente (ex.: grupo/projeto:nome-do-agente).
+
+stages: [build, scan]
+
+variables:
+  TOOLBOX_IMAGE: $CI_REGISTRY_IMAGE:latest
+
+build:
+  stage: build
+  image: docker:27
+  services: [docker:27-dind]
+  variables:
+    DOCKER_TLS_CERTDIR: /certs
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - TAG="${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}"
+    - docker build -t "$CI_REGISTRY_IMAGE:$TAG" -t "$CI_REGISTRY_IMAGE:latest" .
+    - docker push "$CI_REGISTRY_IMAGE:$TAG"
+    - docker push "$CI_REGISTRY_IMAGE:latest"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: [Dockerfile, bin/**/*, lib/**/*, bashrc, .gitlab-ci.yml]
+    - if: $CI_PIPELINE_SOURCE == "web" && $BUILD == "true"
+
+scan:
+  stage: scan
+  image: $TOOLBOX_IMAGE
+  parallel:
+    matrix:
+      # Troque pelos nomes dos contextos que estão no seu KUBECONFIG.
+      # Cada contexto vira um job separado: dá pra ver na hora qual cluster está com problema.
+      - CONTEXT: [producao, homologacao]
+  variables:
+    POPEYE_REPORT_DIR: $CI_PROJECT_DIR/relatorios
+  script:
+    - set -o pipefail
+    - kubectl config use-context "$CONTEXT"
+    - ARQ="$(printf '%s' "$CONTEXT" | tr '/:' '__')"   # contextos do agente/EKS têm "/" e ":"
+    - mkdir -p relatorios
+    # popeye: nota de 0 a 100 e relatório HTML de boas práticas (não derruba o job)
+    - popeye --force-exit-zero --save --out html --output-file "popeye-$ARQ.html" >/dev/null
+    - 'echo "nota popeye: $(popeye --force-exit-zero --out score)"'
+    # k8s-doctor: sai com 1 se achar problema → job falha → GitLab avisa por e-mail
+    - k8s-doctor | tee "relatorios/doctor-$ARQ.txt"
+  artifacts:
+    name: relatorio-$CONTEXT
+    when: always
+    paths: [relatorios/]
+    expire_in: 30 days
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
